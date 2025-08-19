@@ -9,50 +9,111 @@ env:
   ECR_REPOSITORY: flask-app
   EKS_CLUSTER_NAME: Kubernetes-demo 
   AWS_REGION: us-east-1
+  CORTEX_API_KEY: ${{secrets.CORTEX_API_KEY}}
+  CORTEX_API_KEY_ID: ${{secrets.CORTEX_API_KEY_ID}}
+  CORTEX_API_URL: https://api-emea-ccr.xdr.eu.paloaltonetworks.com
+  CORTEX_API_ID: ${{secrets.CORTEX_API_ID}}
+  CORTEX_API_ID_KEY: ${{secrets.CORTEX_API_ID_KEY}}
+  CORTEX_FQDN: ${{secrets.CORTEX_FQDN}}
+  CORTEX_CLI_VERSION: 0.13.0     
 
+  
 jobs:
   
-  build:
+  test-image:
     
     name: Deployment
     runs-on: ubuntu-latest
-
     steps:
-
-    - name: Set short git commit SHA
-      id: commit
-      uses: prompt/actions-commit-hash@v2
 
     - name: Check out code
       uses: actions/checkout@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker image
+      run: |
+        docker build -t my-image-name:latest .
+
+  cortex-Scan:
+
+    name: cortex-code-scan
+    runs-on: ubuntu-latest
+    steps:
+        - name: Checkout Repository
+          uses: actions/checkout@v2
     
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{env.AWS_REGION}}
+        - name: Get Temporary Token
+          run: |
+            TOKEN_RESPONSE=$(curl --location "${CORTEX_API_URL}/public_api/v1/unified-cli/image/token" \
+              --header "Authorization: ${CORTEX_API_KEY}" \
+              --header "x-xdr-auth-id: ${CORTEX_API_KEY_ID}" \
+              --header 'Content-Type: application/json' \
+              --data '{}')
+            TEMP_TOKEN=$(echo $TOKEN_RESPONSE | jq -r '.token')
+            echo "TEMP_TOKEN=$TEMP_TOKEN" >> $GITHUB_ENV
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+        - name: Pull Docker Image
+          run: |
+            docker pull distributions.traps.paloaltonetworks.com/cli-docker/${{env.TEMP_TOKEN}}/method:amd64-${{env.CORTEX_CLI_VERSION}}
+            docker tag distributions.traps.paloaltonetworks.com/cli-docker/${{env.TEMP_TOKEN}}/method:amd64-${{env.CORTEX_CLI_VERSION}} cortexcli:${{env.CORTEX_CLI_VERSION}}
 
-    - name: Build, tag, and push image to Amazon ECR
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}        
-        IMAGE_TAG: ${{ steps.commit.outputs.short }}
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f docker/Dockerfile .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        - name: Run Docker Container
+          run: |
+            docker run --rm -v ${{ github.workspace }}:/home/code cortexcli:${{ env.CORTEX_CLI_VERSION }} \
+              --api-base-url ${CORTEX_API_URL} \
+              --api-key ${CORTEX_API_KEY} \
+              --api-key-id ${CORTEX_API_KEY_ID} \
+              code scan \
+              --directory /home/code \
+              --repo-id ${{github.repository}} \
+              --branch ${{github.ref_name}} \
+              --source 'GITHUB_ACTIONS' \
+              --create-repo-if-missing 
 
-    - name: Update kube config
-      run: aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
+  build-push:
 
-    - name: Deploy to EKS
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}        
-        IMAGE_TAG: ${{ steps.commit.outputs.short }}
-      run: |
-        sed -i.bak "s|DOCKER_IMAGE|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" manifests/hello-app-deployment.yaml && \
-        kubectl apply -f manifests/hello-app-deployment.yaml
-        kubectl apply -f manifests/hello-app-service.yaml
+    name: Build-Push Docker Image
+    runs-on: ubuntu-latest  
+    steps:  
+        - name: Checkout
+          uses: actions/checkout@v2    
+
+        - name: Set short git commit SHA
+          id: commit
+          uses: prompt/actions-commit-hash@v2
+
+        - name: Check out code
+          uses: actions/checkout@v2
+  
+        - name: Configure AWS credentials
+          uses: aws-actions/configure-aws-credentials@v1
+          with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-region: ${{env.AWS_REGION}}
+
+        - name: Login to Amazon ECR
+          id: login-ecr
+          uses: aws-actions/amazon-ecr-login@v1
+
+        - name: Build, tag, and push image to Amazon ECR
+          env:
+            ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}        
+            IMAGE_TAG: ${{ steps.commit.outputs.short }}
+          run: |
+            docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f docker/Dockerfile .
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+        - name: Update kube config
+          run: aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
+
+        - name: Deploy to EKS
+          env:
+            ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}        
+            IMAGE_TAG: ${{ steps.commit.outputs.short }}
+          run: |
+            sed -i.bak "s|DOCKER_IMAGE|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" manifests/hello-app-deployment.yaml && \
+            kubectl apply -f manifests/hello-app-deployment.yaml
+            kubectl apply -f manifests/hello-app-service.yaml
