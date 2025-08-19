@@ -46,7 +46,7 @@ jobs:
 
     - name: Build Docker image
       run: |
-        docker build -t my-image-name:latest .
+        docker build -t my-image-name:latest -f docker/Dockerfile .
 
   cortex-Scan:
 
